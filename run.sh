@@ -84,9 +84,45 @@ if [ -n "$MEM_PATH" ]; then
     fi
 fi
 
+# Find available port starting from HOST_FORWARD_PORT
+check_port_available() {
+    local port=$1
+    if command -v ss >/dev/null 2>&1; then
+        ! ss -tuln | grep -q ":$port "
+    else
+        ! netstat -tuln 2>/dev/null | grep -q ":$port "
+    fi
+}
+
+ORIGINAL_PORT=$HOST_FORWARD_PORT
+while ! check_port_available $HOST_FORWARD_PORT; do
+    HOST_FORWARD_PORT=$((HOST_FORWARD_PORT + 1))
+    if [ $HOST_FORWARD_PORT -gt $((ORIGINAL_PORT + 100)) ]; then
+        echo "Error: Could not find available port in range $ORIGINAL_PORT-$((ORIGINAL_PORT + 100))"
+        exit 1
+    fi
+done
+
+# Check if image file is already in use by another QEMU process
+IMAGE_IN_USE=false
+if [ -n "$IMAGE_FILE" ]; then
+    if lsof "$IMAGE_FILE" >/dev/null 2>&1; then
+        IMAGE_IN_USE=true
+        echo "Image file is in use by another process, enabling snapshot mode"
+    fi
+fi
+
+# Build drive parameter based on whether image is in use
+if [ "$IMAGE_IN_USE" = "true" ]; then
+    DRIVE_PARAM="-drive file=\"$IMAGE_FILE\",format=raw,if=ide,snapshot=on,file.locking=off"
+else
+    DRIVE_PARAM="-drive file=\"$IMAGE_FILE\",format=raw,if=ide"
+fi
+
 # Build QEMU command
 QEMU_CMD="qemu-system-x86_64 \
     -enable-kvm \
+    -cpu host \
     -m \"$MEMORY\" \
     -smp \"$CPU_SOCKETS,sockets=$CPU_SOCKETS,cores=$CPU_CORES\" \
     -mem-path \"$MEM_PATH\""
@@ -101,15 +137,23 @@ QEMU_CMD="$QEMU_CMD \
     -nographic \
     -machine pc-q35-7.1 \
     -net nic,model=e1000 \
-    -net user,hostfwd=tcp::$HOST_FORWARD_PORT-:$GUEST_PORT \
+    -net user,hostname="fuzzer",hostfwd=tcp::$HOST_FORWARD_PORT-:$GUEST_PORT \
     -append \"root=/dev/sda console=ttyS0 rw sysctl.vm.dirty_bytes=2147483647 panic=10 io_delay=0xed libata.allow_tpm=1 nmi_watchdog=panic tco_start=1 slab_nomerge fb_tunnels=none firmware_class.path=/var/google/session net.ifnames=0 sysctl.kernel.hung_task_all_cpu_backtrace=1 ima_policy=tcb nf-conntrack-ftp.ports=20000 nf-conntrack-tftp.ports=20000 nf-conntrack-sip.ports=20000 nf-conntrack-irc.ports=20000 nf-conntrack-sane.ports=20000 binder.debug_mask=0 rcupdate.rcu_expedited=1 rcupdate.rcu_cpu_stall_cputime=1 no_hash_pointers page_owner=on sysctl.vm.nr_hugepages=4 sysctl.vm.nr_overcommit_hugepages=4 secretmem.enable=1 sysctl.max_rcu_stall_to_panic=1 msr.allow_writes=off coredump_filter=0xffff mitigations=off mce=print_all acpi_enforce_resources=lax video=efifb:off hest_disable=1 erst_disable=1 bert_disable=1 retbleed=off spec_rstack_overflow=off eagerfpu=on kvm_amd.nested=0 ccp.init_ex_path=/var/google/persistent/bios/psp_nv_data ccp.psp_init_on_probe=0 console=ttyS0 vsyscall=native kvm-intel.nested=1 spec_store_bypass_disable=prctl nopcid vivid.n_devs=16 vivid.multiplanar=1,2,1,2,1,2,1,2,1,2,1,2,1,2,1,2 netrom.nr_ndevs=16 rose.rose_ndevs=16 smp.csd_lock_timeout=100000 watchdog_thresh=55 workqueue.watchdog_thresh=140 sysctl.net.core.netdev_unregister_timeout_secs=140 dummy_hcd.num=8 resched_latency_warn_ms=0 intel_iommu=optin pcie_port_pm=off pm80xx.link_rate=0x2 pm80xx.spinup_group=5 pm80xx.spinup_interval_ms=10000 pm80xx.spinup_group_decrease=1 scsi_mod.scan=async scsi_mod.force_queue_depth=1,512:0\" \
-    -hda \"$IMAGE_FILE\" \
+    $DRIVE_PARAM \
     -kernel \"$KERNEL_PATH\""
 
 # Add debug options if enabled
 if [ "$DEBUG_MODE" = true ]; then
     QEMU_CMD="$QEMU_CMD -s -S"
 fi
+
+# Print port information
+if [ $HOST_FORWARD_PORT -ne $ORIGINAL_PORT ]; then
+    echo "Port $ORIGINAL_PORT was in use, using port $HOST_FORWARD_PORT instead"
+fi
+echo "SSH access: ssh -p $HOST_FORWARD_PORT localhost"
+
+echo "QEMU command: $QEMU_CMD"
 
 # Execute QEMU command
 eval "$QEMU_CMD"
